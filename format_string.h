@@ -14,6 +14,7 @@
  */
 
 #include <inttypes.h>
+#include "config.h"
 
 #ifdef PRIu32
 # define SIZE_T_PF "%zd"

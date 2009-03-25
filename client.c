@@ -24,6 +24,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdbool.h>
 
 #include <unistd.h>
 #include <fcntl.h>
@@ -32,7 +33,7 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <utime.h>
-#include <stdbool.h>
+#include <time.h>
 
 #ifdef WITH_DMALLOC
 # include <dmalloc.h>
@@ -167,7 +168,7 @@ static struct zsync_state *read_zsync_control_file(struct zsync_client_state *cs
         if (!is_url_absolute(p)) {
             perror(p);
             *error = zs_download_local_err;
-            return;
+            return NULL;
         }
 
         /* Try URL fetch */
@@ -177,7 +178,7 @@ static struct zsync_state *read_zsync_control_file(struct zsync_client_state *cs
         if (!f) {
             fprintf(stderr, "could not read control file from URL %s\n", p);
             *error = zs_download_receive_err;
-            return;
+            return NULL;
         }
         free(cs->referrer);
         cs->referrer = lastpath;
@@ -342,12 +343,12 @@ static int fetch_remaining_blocks_http(struct zsync_client_state *cs,
         if (!cs->quiet) {
             p = cs->progress_routines->start_progress(u);
             fputc('\n', stderr);
-            do_progress(p, calc_zsync_progress(z), cs->http_routines->range_fetch_bytes_down(rf));
+            cs->progress_routines->do_progress(p, calc_zsync_progress(z), cs->http_routines->range_fetch_bytes_down(rf));
         }
 
         /* Loop while we're receiving data, until we're done or there is an error */
         while (!ret
-               && (len = get_range_block(rf, &zoffset, buf, BUFFERSIZE)) > 0) {
+               && (len = cs->http_routines->get_range_block(rf, &zoffset, buf, BUFFERSIZE)) > 0) {
             /* Pass received data to the zsync receiver, which writes it to the
              * appropriate location in the target file */
             if (zsync_receive_data(zr, buf, zoffset, len) != 0)
@@ -469,7 +470,6 @@ zs_return zsync_client(const char *control_file_location,
     }
     
     /* STEP 1: Read the zsync control file */
-    zs_return error = zs_ok;
     zs = read_zsync_control_file(&cs, control_file_location, keep_control_file_path, &ret);
     if(ret != zs_ok) {
         goto bail;
