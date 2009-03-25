@@ -2,6 +2,7 @@
 /*
  *   zsync - client side rsync over http
  *   Copyright (C) 2004,2005,2007,2009 Colin Phipps <cph@moria.org.uk>
+ *   Modifications Copyright (C) 2009 James Montgomerie <jamie@th.ingsmadeoutofotherthin.gs>
  *
  *   This program is free software; you can redistribute it and/or modify
  *   it under the terms of the Artistic License v2 (see the accompanying 
@@ -43,6 +44,8 @@
 #include "url.h"
 #include "progress.h"
 #include "format_string.h"
+
+int no_http_progress;
 
 /* socket = connect_to(host, service/port)
  * Establishes a TCP connection to the named host and port (which can be
@@ -153,9 +156,6 @@ static char *pport;
 static char **auth_details; /* This is a realloced array with 3*num_auth_details entries */
 static int num_auth_details; /* The groups of 3 strings are host, user, pass */
 
-/* Remember referrer */
-char *referer;
-
 /* set_proxy_from_string(str)
  * Sets the proxy settings for HTTP connections to use; these can be either as
  * a host[:port] or as http://host[:port].
@@ -254,7 +254,7 @@ static char *http_date_string(time_t t, char *const buf, const int blen) {
     return NULL;
 }
 
-FILE *http_get(const char *orig_url, char **track_referer, const char *tfname) {
+FILE *http_get(const char *orig_url, char **track_referrer, const char *tfname) {
     int allow_redirects = 5;
     char *url;
     FILE *f = NULL;
@@ -399,8 +399,8 @@ FILE *http_get(const char *orig_url, char **track_referer, const char *tfname) {
 
     /* Store the referrer - we'll supply this when retrieving any content
      * referrer to by this file retrieved. */
-    if (track_referer)
-        *track_referer = url;
+    if (track_referrer)
+        *track_referrer = url;
     else
         free(url);
 
@@ -441,10 +441,13 @@ FILE *http_get(const char *orig_url, char **track_referer, const char *tfname) {
 
         {   /* Now the actual content. Show progress as we go. */
             size_t got = 0;
-            struct progress p = { 0, 0, 0, 0 };
+            void *p = NULL;
+            if(!no_http_progress) 
+                p = start_progress(url);
+
             size_t r;
-            if (!no_progress)
-                do_progress(&p, 0, got);
+            if (!no_http_progress)
+                do_progress(p, 0, got);
 
             while (!feof(f)) {
                 /* Read from the network */
@@ -464,12 +467,12 @@ FILE *http_get(const char *orig_url, char **track_referer, const char *tfname) {
 
                     /* And maintain progress indication */
                     got += r;
-                    if (!no_progress)
-                        do_progress(&p, len ? (100.0 * got / len) : 0, got);
+                    if (!no_http_progress)
+                        do_progress(p, len ? (100.0 * got / len) : 0, got);
                 }
             }
-            if (!no_progress)
-                end_progress(&p, feof(f) ? 2 : 0);
+            if (!no_http_progress)
+                end_progress(p, feof(f) ? 2 : 0);
         }
         fclose(f);
     }
@@ -531,6 +534,8 @@ struct range_fetch {
     int nranges;
     int rangessent;     /* We've requested the first rangessent ranges from the remote */
     int rangesdone;     /* and received this many */
+    
+    char *referrer;
 };
 
 /* range_fetch methods */
@@ -612,7 +617,7 @@ static char *rfgets(char *buf, size_t len, struct range_fetch *rf) {
 /* range_fetch_start(origin_url)
  * Returns a new range fetch object, for the given URL.
  */
-struct range_fetch *range_fetch_start(const char *orig_url) {
+void *range_fetch_start(const char *orig_url, const char* referrer) {
     char *p;
     struct range_fetch *rf = malloc(sizeof(struct range_fetch));
     char hostn[sizeof(rf->hosth)];
@@ -655,13 +660,21 @@ struct range_fetch *range_fetch_start(const char *orig_url) {
     rf->ranges_todo = NULL;             /* And no ranges given yet */
     rf->nranges = rf->rangesdone = 0;
 
+    if(referrer) {
+        rf->referrer = strdup(referrer);
+    }
+    else {
+        rf->referrer = NULL;
+    }
+    
     return rf;
 }
 
 /* range_fetch_addranges(self, off_t[], nranges)
  * Adds ranges to fetch, supplied as an array of 2*nranges offsets (start and
  * stop for each range) */
-void range_fetch_addranges(struct range_fetch *rf, off_t * ranges, int nranges) {
+void range_fetch_addranges(void *rfv, off_t * ranges, int nranges) {
+    struct range_fetch *rf = rfv; 
     int existing_ranges = rf->nranges - rf->rangesdone;
 
     /* Allocate new memory, enough for valid existing entries and new entries */
@@ -713,7 +726,7 @@ static void range_fetch_getmore(struct range_fetch *rf) {
              "%s"
              "Range: bytes=",
              rf->url, rf->hosth,
-             referer ? "\r\nReferer: " : "", referer ? referer : "",
+             rf->referrer ? "\r\nreferrer: " : "", rf->referrer ? rf->referrer : "",
              rf->authh ? rf->authh : "");
 
     /* The for loop here is just a sanity check, lastrange is the real loop control */
@@ -917,8 +930,9 @@ int range_fetch_read_http_headers(struct range_fetch *rf) {
  * are returned - that's just what it asks the remote for, but if the remote
  * returns more then it'll pass more to the caller - which doesn't matter).
  */
-int get_range_block(struct range_fetch *rf, off_t * offset, unsigned char *data,
+int get_range_block(void *rfv, off_t * offset, unsigned char *data,
                     size_t dlen) {
+    struct range_fetch *rf = rfv; 
     size_t bytes_to_caller = 0;
 
     /* If we're not in the middle of reading a block of actual data */
@@ -1083,12 +1097,15 @@ int get_range_block(struct range_fetch *rf, off_t * offset, unsigned char *data,
 
 /* range_fetch_bytes_down
  * Simple getter method, returns the total bytes retrieved */
-off_t range_fetch_bytes_down(const struct range_fetch * rf) {
+off_t range_fetch_bytes_down(const void *rfv) {
+    const struct range_fetch *rf = rfv; 
     return rf->bytes_down;
 }
 
 /* Destructor */
-void range_fetch_end(struct range_fetch *rf) {
+void range_fetch_end(void *rfv) {
+    struct range_fetch *rf = rfv; 
+
     if (rf->sd != -1)
         close(rf->sd);
     free(rf->ranges_todo);
@@ -1096,5 +1113,6 @@ void range_fetch_end(struct range_fetch *rf) {
     free(rf->url);
     free(rf->cport);
     free(rf->chost);
+    free(rf->referrer);
     free(rf);
 }

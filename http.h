@@ -2,6 +2,7 @@
  *   http.h - simple HTTP client for zsync
  *
  *   Copyright (C) 2004,2005,2009 Colin Phipps <cph@moria.org.uk>
+ *   Modifications Copyright (C) 2009 James Montgomerie <jamie@th.ingsmadeoutofotherthin.gs>
  *
  *   This program is free software; you can redistribute it and/or modify
  *   it under the terms of the Artistic License v2 (see the accompanying 
@@ -14,21 +15,17 @@
  *   COPYING file for details.
  */
 
-
-
-extern char *referer;
+extern int no_http_progress;
 
 int set_proxy_from_string(const char* s);
 
-FILE* http_get(const char* orig_url, char** track_referer, const char* tfname);
+FILE* http_get(const char* orig_url, char** track_referrer, const char* tfname);
 
-struct range_fetch;
-
-struct range_fetch* range_fetch_start(const char* orig_url);
-void range_fetch_addranges(struct range_fetch* rf, off_t* ranges, int nranges);
-int get_range_block(struct range_fetch* rf, off_t* offset, unsigned char* data, size_t dlen);
-off_t range_fetch_bytes_down(const struct range_fetch* rf);
-void range_fetch_end(struct range_fetch* rf);
+void* range_fetch_start(const char* orig_url, const char *referrer);
+void range_fetch_addranges(void* rf, off_t* ranges, int nranges);
+int get_range_block(void* rf, off_t* offset, unsigned char* data, size_t dlen);
+off_t range_fetch_bytes_down(const void *rf);
+void range_fetch_end(void* rf);
 
 void add_auth(char* host, char* user, char* pass);
 

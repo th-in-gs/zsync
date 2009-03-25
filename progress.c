@@ -25,7 +25,13 @@
 
 #include "progress.h"
 
-int no_progress;
+struct progress {
+    time_t starttime;
+    time_t lasttime;
+    float lastpcnt;
+    long long lastdl;
+};
+
 
 /* progbar(chars, percent)
  * (Re)print progress bar with chars out of 20 shown and followed by the given
@@ -42,11 +48,21 @@ static void progbar(int j, float pcnt) {
     printf("\r%s %.1f%%", buf, pcnt);
 }
 
+/* state=start_progress(url)
+ * Returns a handle to a progress state used to track progress downloading
+ * from the given URL.*/
+void *start_progress(const char *url)
+{
+    struct progress *p = calloc(sizeof(struct progress), 1);
+    return p;
+}
+
 /* do_progress(progress, percent, total_bytes_retrieved
  * Updates the supplied progress structure with the new % done given, and
  * recalculates the rolling download rate given the supplied
  * total_bytes_retrieved (and the current time) */
-void do_progress(struct progress *p, float pcnt, long long newdl) {
+void do_progress(void *pv, float pcnt, long long newdl) {
+    struct progress *p = pv;
     /* If new or if time has passed, update progress display & data */
     time_t newtime = time(NULL);
     if (p->lasttime != newtime) {
@@ -82,7 +98,8 @@ void do_progress(struct progress *p, float pcnt, long long newdl) {
  * Do one final update of the progress display (set to 100% if done is set to
  * true), and then release the progress data structures.
  */
-void end_progress(struct progress *p, int done) {
+void end_progress(void *pv, int done) {
+    struct progress *p = pv;
     if (done == 2)
         progbar(20, 100.0);
     else
@@ -94,4 +111,5 @@ void end_progress(struct progress *p, int done) {
     }
     puts(done == 2 ? "DONE    \n" : !done ? "aborted    \n" : "        \n");
     fflush(stdout);
+    free(p);
 }

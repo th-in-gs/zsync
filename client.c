@@ -2,6 +2,7 @@
 /*
  *   zsync - client side rsync over http
  *   Copyright (C) 2004,2005,2007,2009 Colin Phipps <cph@moria.org.uk>
+ *   Modifications Copyright (C) 2009 James Montgomerie <jamie@th.ingsmadeoutofotherthin.gs>
  *
  *   This program is free software; you can redistribute it and/or modify
  *   it under the terms of the Artistic License v2 (see the accompanying 
@@ -14,7 +15,9 @@
  *   COPYING file for details.
  */
 
-/* zsync command-line client program */
+/* zsync client library */
+
+#include "client.h"
 
 #include "zsglobal.h"
 
@@ -29,6 +32,7 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <utime.h>
+#include <stdbool.h>
 
 #ifdef WITH_DMALLOC
 # include <dmalloc.h>
@@ -36,9 +40,17 @@
 
 #include "libzsync/zsync.h"
 
-#include "http.h"
 #include "url.h"
-#include "progress.h"
+
+struct zsync_client_state 
+{
+    struct zsync_http_routines *http_routines;
+    struct zsync_progress_routines *progress_routines;
+    bool quiet;
+    unsigned random_seed;
+    char *referrer;
+    long long http_down;
+};
 
 /* FILE* f = open_zcat_pipe(file_str)
  * Returns a (popen) filehandle which when read returns the un-gzipped content
@@ -46,7 +58,7 @@
  * is up to the caller to call pclose() on the handle and check the return
  * value of that.
  */
-FILE* open_zcat_pipe(const char* fname)
+static FILE* open_zcat_pipe(const char* fname, bool quiet)
 {
     /* Get buffer to build command line */
     char *cmd = malloc(6 + strlen(fname) * 2);
@@ -55,7 +67,7 @@ FILE* open_zcat_pipe(const char* fname)
 
     strcpy(cmd, "zcat ");
     {   /* Add filename to commandline, escaping any characters that the shell
-         *might consider special. */
+         * might consider special. */
         int i, j;
 
         for (i = 0, j = 5; fname[i]; i++) {
@@ -66,7 +78,7 @@ FILE* open_zcat_pipe(const char* fname)
         cmd[j] = 0;
     }
 
-    if (!no_progress)
+    if (!quiet)
         fprintf(stderr, "reading seed %s: ", cmd);
     {   /* Finally, open the subshell for reading, and return the handle */
         FILE* f = popen(cmd, "r");
@@ -81,12 +93,12 @@ FILE* open_zcat_pipe(const char* fname)
  * is written to the in-progress target. So use this function to supply local
  * source files which are believed to have data in common with the target.
  */
-void read_seed_file(struct zsync_state *z, const char *fname) {
+static void read_seed_file(struct zsync_client_state *cs, struct zsync_state *z, const char *fname) {
     /* If we should decompress this file */
     if (zsync_hint_decompress(z) && strlen(fname) > 3
         && !strcmp(fname + strlen(fname) - 3, ".gz")) {
         /* Open for reading */
-        FILE *f = open_zcat_pipe(fname);
+        FILE *f = open_zcat_pipe(fname, cs->quiet);
         if (!f) {
             perror("popen");
             fprintf(stderr, "not using seed file %s\n", fname);
@@ -95,7 +107,7 @@ void read_seed_file(struct zsync_state *z, const char *fname) {
 
             /* Give the contents to libzsync to read and find any useful
              * content */
-            zsync_submit_source_file(z, f, !no_progress);
+            zsync_submit_source_file(z, f, !cs->quiet);
 
             /* Close and check for errors */
             if (pclose(f) != 0) {
@@ -114,9 +126,9 @@ void read_seed_file(struct zsync_state *z, const char *fname) {
 
             /* Give the contents to libzsync to read, to find any content that
              * is part of the target file. */
-            if (!no_progress)
+            if (!cs->quiet)
                 fprintf(stderr, "reading seed file %s: ", fname);
-            zsync_submit_source_file(z, f, !no_progress);
+            zsync_submit_source_file(z, f, !cs->quiet);
 
             /* And close */
             if (fclose(f) != 0) {
@@ -129,34 +141,10 @@ void read_seed_file(struct zsync_state *z, const char *fname) {
         long long done, total;
 
         zsync_progress(z, &done, &total);
-        if (!no_progress)
+        if (!cs->quiet)
             fprintf(stderr, "\rRead %s. Target %02.1f%% complete.      \n",
                     fname, (100.0f * done) / total);
     }
-}
-
-long long http_down;
-
-/* A ptrlist is a very simple structure for storing lists of pointers. This is
- * the only function in its API. The structure (not actually a struct) consists
- * of a (pointer to a) void*[] and an int giving the number of entries.
- *
- * ptrlist = append_ptrlist(&entries, ptrlist, new_entry)
- * Like realloc(2), this returns the new location of the ptrlist array; the
- * number of entries is passed by reference and updated in place. The new entry
- * is appended to the list.
- */
-static void **append_ptrlist(int *n, void **p, void *a) {
-    if (!a)
-        return p;
-    p = realloc(p, (*n + 1) * sizeof *p);
-    if (!p) {
-        fprintf(stderr, "out of memory\n");
-        exit(1);
-    }
-    p[*n] = a;
-    (*n)++;
-    return p;
 }
 
 /* zs = read_zsync_control_file(location_str, filename)
@@ -167,7 +155,7 @@ static void **append_ptrlist(int *n, void **p, void *a) {
  * .zsync _if it is retrieved from a URL_; can be NULL in which case no local
  * copy is made.
  */
-struct zsync_state *read_zsync_control_file(const char *p, const char *fn) {
+static struct zsync_state *read_zsync_control_file(struct zsync_client_state *cs, const char *p, const char *fn, zs_return *error) {
     FILE *f;
     struct zsync_state *zs;
     char *lastpath = NULL;
@@ -178,27 +166,32 @@ struct zsync_state *read_zsync_control_file(const char *p, const char *fn) {
         /* No such local file - if not a URL either, report error */
         if (!is_url_absolute(p)) {
             perror(p);
-            exit(2);
+            *error = zs_download_local_err;
+            return;
         }
 
         /* Try URL fetch */
-        f = http_get(p, &lastpath, fn);
+        if(cs->http_routines->http_get) {
+            f = cs->http_routines->http_get(p, &lastpath, fn);
+        }
         if (!f) {
             fprintf(stderr, "could not read control file from URL %s\n", p);
-            exit(3);
+            *error = zs_download_receive_err;
+            return;
         }
-        referer = lastpath;
+        free(cs->referrer);
+        cs->referrer = lastpath;
     }
 
     /* Read the .zsync */
     if ((zs = zsync_begin(f)) == NULL) {
-        exit(1);
+        *error = zs_read_control_file_err;
     }
 
     /* And close it */
     if (fclose(f) != 0) {
         perror("fclose");
-        exit(2);
+        *error = zs_download_local_err;
     }
     return zs;
 }
@@ -232,7 +225,7 @@ static char *get_filename_prefix(const char *p) {
 /* filename_str = get_filename(zs, source_filename_str)
  * Returns a (malloced string with a) suitable filename for a zsync download,
  * using the given zsync state and source filename strings as hints. */
-char *get_filename(const struct zsync_state *zs, const char *source_name) {
+static char *get_filename(const struct zsync_state *zs, const char *source_name) {
     char *p = zsync_filename(zs);
     char *filename = NULL;
 
@@ -284,43 +277,45 @@ static float calc_zsync_progress(const struct zsync_state *zs) {
  */
 #define BUFFERSIZE 8192
 
-int fetch_remaining_blocks_http(struct zsync_state *z, const char *url,
-                                int type) {
+static int fetch_remaining_blocks_http(struct zsync_client_state *cs, 
+                                       struct zsync_state *z, 
+                                       const char *url,
+                                       int type) {
     int ret = 0;
-    struct range_fetch *rf;
+    void *rf;
     unsigned char *buf;
     struct zsync_receiver *zr;
 
     /* URL might be relative - we need an absolute URL to do a fetch */
-    char *u = make_url_absolute(referer, url);
+    char *u = make_url_absolute(cs->referrer, url);
     if (!u) {
         fprintf(stderr,
-                "URL '%s' from the .zsync file is relative, but I don't know the referer URL (you probably downloaded the .zsync separately and gave it to me as a file). I need to know the referring URL (the URL of the .zsync) in order to locate the download. You can specify this with -u (or edit the URL line(s) in the .zsync file you have).\n",
+                "URL '%s' from the .zsync file is relative, but I don't know the referrer URL (you probably downloaded the .zsync separately and gave it to me as a file). I need to know the referring URL (the URL of the .zsync) in order to locate the download. You can specify this with -u (or edit the URL line(s) in the .zsync file you have).\n",
                 url);
         return -1;
     }
 
     /* Start a range fetch and a zsync receiver */
-    rf = range_fetch_start(u);
+    rf = cs->http_routines->range_fetch_start(u, cs->referrer);
     if (!rf) {
         free(u);
         return -1;
     }
     zr = zsync_begin_receive(z, type);
     if (!zr) {
-        range_fetch_end(rf);
+        cs->http_routines->range_fetch_end(rf);
         free(u);
         return -1;
     }
 
-    if (!no_progress)
+    if (!cs->quiet)
         fprintf(stderr, "downloading from %s:", u);
 
     /* Create a read buffer */
     buf = malloc(BUFFERSIZE);
     if (!buf) {
         zsync_end_receive(zr);
-        range_fetch_end(rf);
+        cs->http_routines->range_fetch_end(rf);
         free(u);
         return -1;
     }
@@ -334,19 +329,20 @@ int fetch_remaining_blocks_http(struct zsync_state *z, const char *url,
             return 0;
 
         /* And give that to the range fetcher */
-        range_fetch_addranges(rf, zbyterange, nrange);
+        cs->http_routines->range_fetch_addranges(rf, zbyterange, nrange);
         free(zbyterange);
     }
 
     {
         int len;
         off_t zoffset;
-        struct progress p = { 0, 0, 0, 0 };
+        void *p = NULL;
 
         /* Set up progress display to run during the fetch */
-        if (!no_progress) {
+        if (!cs->quiet) {
+            p = cs->progress_routines->start_progress(u);
             fputc('\n', stderr);
-            do_progress(&p, calc_zsync_progress(z), range_fetch_bytes_down(rf));
+            do_progress(p, calc_zsync_progress(z), cs->http_routines->range_fetch_bytes_down(rf));
         }
 
         /* Loop while we're receiving data, until we're done or there is an error */
@@ -358,9 +354,9 @@ int fetch_remaining_blocks_http(struct zsync_state *z, const char *url,
                 ret = 1;
 
             /* Maintain progress display */
-            if (!no_progress)
-                do_progress(&p, calc_zsync_progress(z),
-                            range_fetch_bytes_down(rf));
+            if (!cs->quiet)
+                cs->progress_routines->do_progress(p, calc_zsync_progress(z),
+                                                   cs->http_routines->range_fetch_bytes_down(rf));
 
             // Needed in case next call returns len=0 and we need to signal where the EOF was.
             zoffset += len;     
@@ -373,24 +369,26 @@ int fetch_remaining_blocks_http(struct zsync_state *z, const char *url,
                  *could be data in its buffer that it can use or needs to process */
             zsync_receive_data(zr, NULL, zoffset, 0);
 
-        if (!no_progress)
-            end_progress(&p, zsync_status(z) >= 2 ? 2 : len == 0 ? 1 : 0);
+        if (!cs->quiet)
+            cs->progress_routines->end_progress(p, zsync_status(z) >= 2 ? 2 : len == 0 ? 1 : 0);
     }
 
     /* Clean up */
     free(buf);
-    http_down += range_fetch_bytes_down(rf);
+    cs->http_down += cs->http_routines->range_fetch_bytes_down(rf);
     zsync_end_receive(zr);
-    range_fetch_end(rf);
+    cs->http_routines->range_fetch_end(rf);
     free(u);
     return ret;
 }
 
-/* fetch_remaining_blocks(zs)
+/* fetch_remaining_blocks(zs, random_seed)
  * Using the URLs in the supplied zsync state, downloads data to complete the
  * target file. 
+ * random_seed is a seed used by the random number generator that controls
+ * the order URLs are fetched from.
  */
-int fetch_remaining_blocks(struct zsync_state *zs) {
+static int fetch_remaining_blocks(struct zsync_client_state *cs, struct zsync_state *zs) {
     int n, utype;
     const char *const *url = zsync_get_urls(zs, &n, &utype);
     int *status;        /* keep status for each URL - 0 means no error */
@@ -405,13 +403,13 @@ int fetch_remaining_blocks(struct zsync_state *zs) {
     /* Keep going until we're done or have no useful URLs left */
     while (zsync_status(zs) < 2 && ok_urls) {
         /* Still need data; pick a URL to use. */
-        int try = rand() % n;
+        int try = rand_r(&(cs->random_seed)) % n;
 
         if (!status[try]) {
             const char *tryurl = url[try];
 
             /* Try fetching data from this URL */
-            int rc = fetch_remaining_blocks_http(zs, tryurl, utype);
+            int rc = fetch_remaining_blocks_http(cs, zs, tryurl, utype);
             if (rc != 0) {
                 fprintf(stderr, "failed to retrieve from %s\n", tryurl);
                 status[try] = 1;
@@ -423,7 +421,7 @@ int fetch_remaining_blocks(struct zsync_state *zs) {
     return 0;
 }
 
-static int set_mtime(char* filename, time_t mtime) {
+static int set_mtime(const char* filename, time_t mtime) {
     struct stat s;
     struct utimbuf u;
 
@@ -443,100 +441,49 @@ static int set_mtime(char* filename, time_t mtime) {
     return 0;
 }
 
-/****************************************************************************
- *
- * Main program */
-int main(int argc, char **argv) {
-    struct zsync_state *zs;
+zs_return zsync_client(const char *control_file_location, 
+                       const char *keep_control_file_path, 
+                       const char *output_file_path, 
+                       const char *referrer,
+                       char **seedfiles,
+                       const int nseedfiles,
+                       bool quiet,
+                       struct zsync_http_routines *http_routines,
+                       struct zsync_progress_routines *progress_routines) {
+    zs_return ret = zs_ok;
+    
+    struct zsync_client_state cs = { 0 };
+    struct zsync_state *zs = NULL;
     char *temp_file = NULL;
-    char **seedfiles = NULL;
-    int nseedfiles = 0;
-    char *filename = NULL;
-    long long local_used;
-    char *zfname = NULL;
-    time_t mtime;
+    long long local_used = 0;
 
-    srand(getpid());
-    {   /* Option parsing */
-        int opt;
+    cs.http_routines = http_routines;
+    cs.progress_routines = progress_routines;
+    cs.quiet = quiet;
 
-        while ((opt = getopt(argc, argv, "A:k:o:i:Vsqu:")) != -1) {
-            switch (opt) {
-            case 'A':           /* Authentication options for remote server */
-                {               /* Scan string as hostname=username:password */
-                    char *p = strdup(optarg);
-                    char *q = strchr(p, '=');
-                    char *r = q ? strchr(q, ':') : NULL;
-
-                    if (!q || !r) {
-                        fprintf(stderr,
-                                "-A takes hostname=username:password\n");
-                        exit(1);
-                    }
-                    else {
-                        *q++ = *r++ = 0;
-                        add_auth(p, q, r);
-                    }
-                }
-                break;
-            case 'k':
-                free(zfname);
-                zfname = strdup(optarg);
-                break;
-            case 'o':
-                free(filename);
-                filename = strdup(optarg);
-                break;
-            case 'i':
-                seedfiles = append_ptrlist(&nseedfiles, seedfiles, optarg);
-                break;
-            case 'V':
-                printf(PACKAGE " v" VERSION " (compiled " __DATE__ " " __TIME__
-                       ")\n" "By Colin Phipps <cph@moria.org.uk>\n"
-                       "Published under the Artistic License v2, see the COPYING file for details.\n");
-                exit(0);
-            case 's':
-            case 'q':
-                no_progress = 1;
-                break;
-            case 'u':
-                referer = strdup(optarg);
-                break;
-            }
-        }
+    /* Initialise the random seed used throughout */
+    cs.random_seed = (unsigned)getpid() ^ (unsigned)time(NULL);
+    
+    if(referrer) {
+        cs.referrer = strdup(referrer);
     }
-
-    /* Last and only non-option parameter must be the path/URL of the .zsync */
-    if (optind == argc) {
-        fprintf(stderr,
-                "No .zsync file specified.\nUsage: zsync http://example.com/some/filename.zsync\n");
-        exit(3);
-    }
-    else if (optind < argc - 1) {
-        fprintf(stderr,
-                "Usage: zsync http://example.com/some/filename.zsync\n");
-        exit(3);
-    }
-
-    /* No progress display except on terminal */
-    if (!isatty(0))
-        no_progress = 1;
-    {   /* Get proxy setting from the environment */
-        char *pr = getenv("http_proxy");
-
-        if (pr != NULL)
-            set_proxy_from_string(pr);
-    }
-
+    
     /* STEP 1: Read the zsync control file */
-    if ((zs = read_zsync_control_file(argv[optind], zfname)) == NULL)
-        exit(1);
+    zs_return error = zs_ok;
+    zs = read_zsync_control_file(&cs, control_file_location, keep_control_file_path, &ret);
+    if(ret != zs_ok) {
+        goto bail;
+    } else if (zs == NULL) {
+        ret = zs_read_control_file_err;
+        goto bail;
+    }
+    
 
     /* Get eventual filename for output, and filename to write to while working */
-    if (!filename)
-        filename = get_filename(zs, argv[optind]);
-    temp_file = malloc(strlen(filename) + 6);
-    strcpy(temp_file, filename);
+    if (!output_file_path)
+        output_file_path = get_filename(zs, control_file_location);
+    temp_file = malloc(strlen(output_file_path) + 6);
+    strcpy(temp_file, output_file_path);
     strcat(temp_file, ".part");
 
     {   /* STEP 2: read available local data and fill in what we know in the
@@ -545,12 +492,12 @@ int main(int argc, char **argv) {
 
         /* Try any seed files supplied by the command line */
         for (i = 0; i < nseedfiles; i++) {
-            read_seed_file(zs, seedfiles[i]);
+            read_seed_file(&cs, zs, seedfiles[i]);
         }
         /* If the target file already exists, we're probably updating that file
          * - so it's a seed file */
-        if (!access(filename, R_OK)) {
-            read_seed_file(zs, filename);
+        if (!access(output_file_path, R_OK)) {
+            read_seed_file(&cs, zs, output_file_path);
         }
         /* If the .part file exists, it's probably an interrupted earlier
          * effort; a normal HTTP client would 'resume' from where it got to,
@@ -558,7 +505,7 @@ int main(int argc, char **argv) {
          * current version on the remote) and doesn't need to, because we can
          * treat it like any other local source of data. Use it now. */
         if (!access(temp_file, R_OK)) {
-            read_seed_file(zs, temp_file);
+            read_seed_file(&cs, zs, temp_file);
         }
 
         /* Show how far that got us */
@@ -568,7 +515,7 @@ int main(int argc, char **argv) {
          * downloading everything. Although not essential, let's hint to them
          * that they probably messed up. */
         if (!local_used) {
-            if (!no_progress)
+            if (!cs.quiet)
                 fputs
                     ("No relevent local data found - I will be downloading the whole file. If that's not what you want, CTRL-C out. You should specify the local file is the old version of the file to download with -i (you might have to decompress it with gzip -d first). Or perhaps you just have no data that helps download the file\n",
                      stderr);
@@ -583,33 +530,37 @@ int main(int argc, char **argv) {
      * from the old .part). */
     if (zsync_rename_file(zs, temp_file) != 0) {
         perror("rename");
-        exit(1);
+        ret = zs_read_control_file_err;
+        goto bail;
     }
 
     /* STEP 3: fetch remaining blocks via the URLs from the .zsync */
-    if (fetch_remaining_blocks(zs) != 0) {
+    if (fetch_remaining_blocks(&cs, zs) != 0) {
         fprintf(stderr,
                 "failed to retrieve all remaining blocks - no valid download URLs remain. Incomplete transfer left in %s.\n(If this is the download filename with .part appended, zsync will automatically pick this up and reuse the data it has already done if you retry in this dir.)\n",
                 temp_file);
-        exit(3);
+        ret = zs_download_receive_err;
+        goto bail;
     }
 
     {   /* STEP 4: verify download */
         int r;
 
-        if (!no_progress)
+        if (!cs.quiet)
             printf("verifying download...");
         r = zsync_complete(zs);
         switch (r) {
         case -1:
             fprintf(stderr, "Aborting, download available in %s\n", temp_file);
-            exit(2);
+            ret = zs_download_local_err;
+            goto bail;
+            break;
         case 0:
-            if (!no_progress)
+            if (!cs.quiet)
                 printf("no recognised checksum found\n");
             break;
         case 1:
-            if (!no_progress)
+            if (!cs.quiet)
                 printf("checksum matches OK\n");
             break;
         }
@@ -620,43 +571,44 @@ int main(int argc, char **argv) {
     /* Get any mtime that we is suggested to set for the file, and then shut
      * down the zsync_state as we are done on the file transfer. Getting the
      * current name of the file at the same time. */
-    mtime = zsync_mtime(zs);
+    time_t mtime = zsync_mtime(zs);
     temp_file = zsync_end(zs);
 
     /* STEP 5: Move completed .part file into place as the final target */
-    if (filename) {
-        char *oldfile_backup = malloc(strlen(filename) + 8);
+    if (output_file_path) {
+        char *oldfile_backup = malloc(strlen(output_file_path) + 8);
         int ok = 1;
 
-        strcpy(oldfile_backup, filename);
+        strcpy(oldfile_backup, output_file_path);
         strcat(oldfile_backup, ".zs-old");
 
-        if (!access(filename, F_OK)) {
+        if (!access(output_file_path, F_OK)) {
             /* backup of old file */
             unlink(oldfile_backup);     /* Don't care if this fails - the link below will catch any failure */
-            if (link(filename, oldfile_backup) != 0) {
+            if (link(output_file_path, oldfile_backup) != 0) {
                 perror("link");
                 fprintf(stderr,
                         "Unable to back up old file %s - completed download left in %s\n",
-                        filename, temp_file);
+                        output_file_path, temp_file);
                 ok = 0;         /* Prevent overwrite of old file below */
+                ret = zs_backup_old_file_err;
             }
         }
         if (ok) {
             /* Rename the file to the desired name */
-            if (rename(temp_file, filename) == 0) {
+            if (rename(temp_file, output_file_path) == 0) {
                 /* final, final thing - set the mtime on the file if we have one */
-                if (mtime != -1) set_mtime(filename, mtime);
+                if (mtime != -1) set_mtime(output_file_path, mtime);
             }
             else {
                 perror("rename");
                 fprintf(stderr,
                         "Unable to back up old file %s - completed download left in %s\n",
-                        filename, temp_file);
+                        output_file_path, temp_file);
+                ret = zs_move_received_file_err;
             }
         }
         free(oldfile_backup);
-        free(filename);
     }
     else {
         printf
@@ -664,10 +616,16 @@ int main(int argc, char **argv) {
              temp_file);
     }
 
+bail:
     /* Final stats and cleanup */
-    if (!no_progress)
-        printf("used %lld local, fetched %lld\n", local_used, http_down);
-    free(referer);
+    if (!cs.quiet)
+        printf("used %lld local, fetched %lld\n", local_used, cs.http_down);
+    
+    free(cs.referrer);
     free(temp_file);
-    return 0;
+    
+    return ret;
 }
+
+
+

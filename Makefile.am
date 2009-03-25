@@ -8,10 +8,13 @@ bin_PROGRAMS = zsyncmake zsync
 zsyncmake_SOURCES = make.c makegz.c makegz.h format_string.h
 zsyncmake_LDADD = libzsync/libzsync.a librcksum/librcksum.a zlib/libinflate.a zlib/libdeflate.a -lm
 
-zsync_SOURCES = client.c http.c http.h url.c url.h progress.c progress.h base64.c format_string.h zsglobal.h
-zsync_LDADD = libzsync/libzsync.a librcksum/librcksum.a zlib/libinflate.a $(LIBOBJS)
+noinst_LIBRARIES = libzsyncclient.a
+libzsyncclient_a_SOURCES = client.c url.c url.h progress.c progress.h base64.c format_string.h zsglobal.h 
 
-EXTRA_zsync_SOURCES = getaddrinfo.h
+EXTRA_libzsyncclient_a_SOURCES = getaddrinfo.h
+
+zsync_SOURCES = clientcommand.c http.c http.h 
+zsync_LDADD = libzsyncclient.a libzsync/libzsync.a librcksum/librcksum.a zlib/libinflate.a $(LIBOBJS)
 
 # From "GNU autoconf, automake and libtool" Vaughan, Elliston, 
 # #  Tromey and Taylor, publisher New Riders, p.134
