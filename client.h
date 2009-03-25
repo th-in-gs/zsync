@@ -21,33 +21,37 @@
 
 struct zsync_http_routines {
     // Takes a URL, referrer (updated on a redirect), optional filename to save to.
-    // Returns a handle to the file, opened and poritioned at the beginning.
-    // Referrer will be freed by the caller.
-    // May be NULL if the zsync control file is already local.
+    // Return a handle to the file, opened and positioned at the beginning.
+    // Returned referrer will be freed by the caller.
+    // This pointer ('http_get' in the zsync_http_routines structure) may be 
+    // NULL if the zsync control file specified in the zsync_client call is
+    // already local.
     FILE*(*http_get)(const char *orig_url, char **track_referrer, const char *tfname); 
     
-    // Prepare to fetch some ranges from a URL.  Returns a status blob, to be used internally.
+    // Prepare to fetch some ranges from a URL.  
+    // Returns a status blob referred to by the calls below..
     void*(*range_fetch_start)(const char *url, const char* referrer);
 
     // Add ranges to this request.
     // First argument is the status blob, from range_fetch_start.
-    // Second argument is an array of offsets, third argument in number of ranges.
+    // Second argument is an array of offsets.
+    // Third argument in number of ranges (pairs of offsets) in the offsets list.
     void(*range_fetch_addranges)(void *rf, off_t* ranges, int nranges);
     
-    // Called repeatedly to get the data for a set of ranges fetches.
-    // First argument is the status blob.
-    // Second argument is set to the offset this data starts at.
-    // Third argument is set to the data itsself, and valid only until the 
-    // next call, or until range_fetch_end is called.
-    // Fourth argument is the data length.
+    // Called repeatedly to get the data for a set of range fetches.
+    // First argument is the status blob from range_fetch_start.
+    // Second argument will be set to the offset the received data starts at.
+    // Third argument is a buffer to receive data in.
+    // Fourth argument is the data buffer length.
+    // Return the total bytes read, 0 for EOF, -1 for error (like 'read').
     int(*get_range_block)(void *rf, off_t *offset, unsigned char *data, size_t dlen);
     
-    // Returns the total bytes retreived in thie request.
+    // Returns the total bytes retreived in this request.
     // Takes a status blob.
     off_t(*range_fetch_bytes_down)(const void *rf);
     
     // Called after a set of range fetches is complete.
-    // Takes a status blob (which should become invalid after this call)
+    // Takes a status blob (which should become invalid after this call).
     void(*range_fetch_end)(void *rf);
 };
 
