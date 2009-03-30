@@ -37,7 +37,8 @@ const char http_scheme[] = { "http://" };
  * Or return value NULL on failure (host and port could have been written to).
  */
 char *get_http_host_port(const char *url, char *hostn, int hnlen, char **port) {
-    char *p, *q;
+    char *p;
+    const char *q;
 
     /* Check it's HTTP */
     if (memcmp(url, http_scheme, strlen(http_scheme)))

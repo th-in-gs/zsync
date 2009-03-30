@@ -340,7 +340,7 @@ static int fetch_remaining_blocks_http(struct zsync_client_state *cs,
         void *p = NULL;
 
         /* Set up progress display to run during the fetch */
-        if (!cs->quiet) {
+        if (!cs->quiet && cs->progress_routines) {
             p = cs->progress_routines->start_progress(u);
             fputc('\n', stderr);
             cs->progress_routines->do_progress(p, calc_zsync_progress(z), cs->http_routines->range_fetch_bytes_down(rf));
@@ -355,7 +355,7 @@ static int fetch_remaining_blocks_http(struct zsync_client_state *cs,
                 ret = 1;
 
             /* Maintain progress display */
-            if (!cs->quiet)
+            if (!cs->quiet && cs->progress_routines)
                 cs->progress_routines->do_progress(p, calc_zsync_progress(z),
                                                    cs->http_routines->range_fetch_bytes_down(rf));
 
@@ -370,7 +370,7 @@ static int fetch_remaining_blocks_http(struct zsync_client_state *cs,
                  *could be data in its buffer that it can use or needs to process */
             zsync_receive_data(zr, NULL, zoffset, 0);
 
-        if (!cs->quiet)
+        if (!cs->quiet && cs->progress_routines)
             cs->progress_routines->end_progress(p, zsync_status(z) >= 2 ? 2 : len == 0 ? 1 : 0);
     }
 
