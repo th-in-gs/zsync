@@ -53,8 +53,22 @@ struct rcksum_state *rcksum_init(zs_blockid nblocks, size_t blocksize,
      * context to do block matching */
     z->context = blocksize * require_consecutive_matches;
 
-    /* Temporary file to hold the target file as we get blocks for it */
-    z->filename = strdup("rcksum-XXXXXX");
+    /* Temporary file to hold the target file as we get blocks for it 
+     * Create this in the temporary directory pointed to by $TMPNAM
+     * if there is one */
+    char *tmpdir = getenv("TMPDIR");
+    if(tmpdir) {
+        size_t tmpdir_length = strlen(tmpdir);
+        z->filename = malloc(tmpdir_length + 15);
+        strcpy(z->filename, tmpdir);
+        if(z->filename[tmpdir_length - 1] != '/') {
+            z->filename[tmpdir_length] = '/';
+            ++tmpdir_length;
+        }
+        strcpy(z->filename + tmpdir_length, "rcksum-XXXXXX");        
+    } else {
+        z->filename = strdup("rcksum-XXXXXX");
+    }
 
     /* Initialise to 0 various state & stats */
     z->gotblocks = 0;
